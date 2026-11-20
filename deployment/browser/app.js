@@ -142,7 +142,7 @@ const PLAYBACK_WORKLET = `
 const blobUrl = (code) =>
   URL.createObjectURL(new Blob([code], { type: 'application/javascript' }))
 
-let ws, captureCtx, playbackCtx, playback, mic, callStart, timer
+let activeCall, callStart, timer
 
 // --- microphones ---
 // Labels stay empty until mic permission is granted, so this runs again after
@@ -172,7 +172,7 @@ async function listMics() {
 listMics()
 navigator.mediaDevices?.addEventListener?.('devicechange', listMics)
 
-$('btn').onclick = () => (ws?.readyState <= 1 ? stop() : start())
+$('btn').onclick = () => (activeCall ? stop() : start())
 $('log-toggle').onclick = () => {
   const hidden = document.body.classList.toggle('no-side')
   $('log-toggle').textContent = hidden ? 'Show' : 'Hide'
@@ -216,6 +216,37 @@ async function addWorklet(ctx, code, name) {
 }
 
 async function start() {
+  if (activeCall) return
+  let ws, captureCtx, playbackCtx, playback, mic
+  let ready = false
+  let stopped = false
+  const call = { finish }
+  activeCall = call
+
+  async function finish(state, detail, graceful = false) {
+    if (stopped) return
+    stopped = true
+    ready = false
+    $('btn').disabled = true
+    clearInterval(timer)
+    // Stop capture immediately, then wait for both contexts before allowing
+    // another call to acquire the microphone.
+    playback?.port.postMessage('stop')
+    mic?.getTracks().forEach((track) => track.stop())
+    if (graceful && ws?.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'session.end' }))
+      logEvent('up', 'session.end')
+      const socket = ws
+      setTimeout(() => { if (socket.readyState <= 1) socket.close() }, 3000)
+    } else {
+      ws?.close()
+    }
+    await Promise.allSettled([captureCtx?.close(), playbackCtx?.close()])
+    if (activeCall !== call) return
+    activeCall = null
+    reset()
+    setStatus(state, detail)
+  }
   $('btn').disabled = true
   $('mic').disabled = true
   setStatus('connecting')
@@ -224,8 +255,7 @@ async function start() {
     // The API key never reaches the page; this token expires in 60 seconds.
     const res = await fetch('/token')
     if (!res.ok) {
-      setStatus('error', 'could not mint a token, check the API key')
-      reset()
+      await finish('error', 'could not mint a token, check the API key')
       return
     }
     const { token } = await res.json()
@@ -256,11 +286,10 @@ async function start() {
     const url = new URL('wss://agents.assemblyai.com/v1/ws')
     url.searchParams.set('token', token)
     ws = new WebSocket(url)
-    let ready = false
 
     // The API takes base64 inside JSON, not binary frames.
     capture.port.onmessage = ({ data }) => {
-      if (!ready || ws.readyState !== 1) return
+      if (stopped || activeCall !== call || !ready || ws.readyState !== 1) return
       const bytes = new Uint8Array(data)
       let binary = ''
       for (let i = 0; i < bytes.length; i += 0x8000) {
@@ -272,12 +301,17 @@ async function start() {
 
     // Everything about the agent lives server-side; the session just names it.
     ws.onopen = () => {
+      if (stopped || activeCall !== call) return
       ws.send(JSON.stringify({ type: 'session.update', session: { agent_id: AGENT.id } }))
       logEvent('up', 'session.update', AGENT.id)
     }
 
     ws.onmessage = ({ data }) => {
       const msg = JSON.parse(data)
+      if (stopped || activeCall !== call) {
+        if (msg.type === 'session.ended') ws.close()
+        return
+      }
       switch (msg.type) {
         case 'session.ready':
           ready = true
@@ -356,7 +390,7 @@ async function start() {
 
         case 'session.ended':
           logEvent('down', msg.type)
-          ws.close()
+          void finish('idle')
           break
 
         case 'session.error':
@@ -369,31 +403,15 @@ async function start() {
       }
     }
 
-    ws.onclose = () => { setStatus('idle'); reset() }
-    ws.onerror = () => { setStatus('error', 'connection failed'); reset() }
+    ws.onclose = () => { void finish('idle') }
+    ws.onerror = () => { void finish('error', 'connection failed') }
   } catch (error) {
-    setStatus('error', error.message)
-    reset()
+    await finish('error', error.message)
   }
 }
 
 function stop() {
-  // Close cleanly so the session record ends, falling back to the socket.
-  if (ws?.readyState === 1) {
-    ws.send(JSON.stringify({ type: 'session.end' }))
-    logEvent('up', 'session.end')
-    const socket = ws
-    setTimeout(() => { if (socket.readyState === 1) socket.close() }, 3000)
-  } else {
-    ws?.close()
-  }
-  playback?.port.postMessage('stop')
-  mic?.getTracks().forEach((track) => track.stop())
-  captureCtx?.close()
-  playbackCtx?.close()
-  captureCtx = playbackCtx = playback = mic = null
-  reset()
-  setStatus('idle')
+  void activeCall?.finish('idle', undefined, true)
 }
 
 function reset() {

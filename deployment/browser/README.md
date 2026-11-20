@@ -48,6 +48,8 @@ The session message contains only `{ agent_id }`. Prompt, voice, tools and turn 
 
 The server is [server.py](server.py), the page is [index.html](index.html) and the client is [app.js](app.js), all served as they are. Save and refresh.
 
+`node --test test/browser-client.test.mjs` runs the call lifecycle tests in [test/browser-client.test.mjs](../../test/browser-client.test.mjs) against `app.js`, with fake browser APIs, so they need Node 18+ but no microphone or API key. The same file runs in the JS starter.
+
 ## Hosting
 
 `render.yaml` is configured for one-click deploys. Render prompts for `ASSEMBLYAI_API_KEY` during Blueprint creation, since that is the only variable marked `sync: false`, and sets `PORT` itself. `AGENT` and `AGENT_ID` arrive with defaults and are editable under Environment on the service.
